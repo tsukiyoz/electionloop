@@ -1,49 +1,38 @@
 package runner
 
 import (
-	"time"
-
 	cliflag "zen/pkg/app/flag"
 
 	"github.com/spf13/pflag"
 )
 
 type Options struct {
-	HTTP *HTTPOptions
-	GRPC *GRPCOptions
+	// HTTP *HTTPOptions
+	// GRPC *GRPCOptions
+	ETCD *ETCDOptions
 }
 
 func NewOptions() *Options {
 	return &Options{
-		HTTP: &HTTPOptions{
-			Addr: ":8080",
-		},
-		GRPC: &GRPCOptions{
-			Addr: ":9090",
-		},
+		ETCD: &ETCDOptions{},
 	}
 }
 
 func (s *Options) Flags() (fss cliflag.NamedFlagSets) {
-	s.HTTP.AddFlags(fss.FlagSet("http"))
-	s.GRPC.AddFlags(fss.FlagSet("grpc"))
+	s.ETCD.AddFlags(fss.FlagSet("etcd"))
 	return
 }
 
-type HTTPOptions struct {
-	Addr    string
-	Timeout time.Duration
+type ETCDOptions struct {
+	Endpoints []string `mapstructure:"endpoints"`
+	TlsCacert string   `mapstructure:"tls-cacert"`
+	TlsCert   string   `mapstructure:"tls-cert"`
+	TlsKey    string   `mapstructure:"tls-key"`
 }
 
-func (s *HTTPOptions) AddFlags(fs *pflag.FlagSet) {
-	fs.StringVar(&s.Addr, "http-addr", s.Addr, "The address to bind the HTTP server to.")
-	fs.DurationVar(&s.Timeout, "http-timeout", s.Timeout, "The timeout for the HTTP server.")
-}
-
-type GRPCOptions struct {
-	Addr string
-}
-
-func (s *GRPCOptions) AddFlags(fs *pflag.FlagSet) {
-	fs.StringVar(&s.Addr, "grpc-addr", s.Addr, "The address to bind the gRPC server to.")
+func (s *ETCDOptions) AddFlags(fs *pflag.FlagSet) {
+	fs.StringArrayVar(&s.Endpoints, "etcd-endpoints", []string{"127.0.0.1:2379"}, "etcd endpoints")
+	fs.StringVar(&s.TlsCacert, "etcd-tls-cacert", "", "etcd tls cacert")
+	fs.StringVar(&s.TlsCert, "etcd-tls-cert", "", "etcd tls cert")
+	fs.StringVar(&s.TlsKey, "etcd-tls-key", "", "etcd tls key")
 }

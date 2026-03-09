@@ -3,3 +3,10 @@ http:
 
 grpc:
   addr: "0.0.0.0:9000"
+
+etcd:
+  endpoints:
+    - "https://123.207.207.107:2379"
+  tls-cacert: /Users/admin/workspace/certs/etcd/ca.crt
+  tls-cert: /Users/admin/workspace/certs/etcd/client.crt
+  tls-key: /Users/admin/workspace/certs/etcd/client.key
