@@ -79,45 +79,63 @@ func NewServer(ctx context.Context, data *data.Data, nodeID string) (*Server, er
 }
 
 func (s *Server) Run() error {
+	for {
+		select {
+		case <-s.ctx.Done():
+			slog.Info("server exited")
+			return nil
+		default:
+			if err := s.run(s.ctx); err != nil {
+				slog.Error("session run failed", "err", err)
+				time.Sleep(time.Millisecond * 100)
+			}
+		}
+	}
+}
+
+func (s *Server) run(ctx context.Context) error {
 	session, err := concurrency.NewSession(s.data.Etcd,
-		concurrency.WithContext(s.ctx),
+		concurrency.WithContext(ctx),
 		concurrency.WithTTL(15),
 	)
 	if err != nil {
 		return err
 	}
-	defer func() {
-		session.Close()
-	}()
+	defer session.Close()
 
 	s.election = concurrency.NewElection(session, "/election")
 
-	// Start three independent loops
-	go s.eventLoop()
-	go s.watchLoop()
-	go s.campaignLoop()
+	var wg sync.WaitGroup
 
-	// Wait for context cancellation
-	<-s.ctx.Done()
-	slog.Info("server shutting down")
+	wg.Go(func() {
+		s.eventLoop(ctx)
+	})
+	wg.Go(func() {
+		s.watchLoop(ctx)
+	})
+	wg.Go(func() {
+		s.campaignLoop(ctx)
+	})
 
-	s.gracefulShutdown()
+	wg.Wait()
 
-	return nil
+	slog.Info("session closed, stopping all loops")
+
+	return ctx.Err()
 }
 
-// 1. Watch Loop: 只负责监听 leader 变化
-func (s *Server) watchLoop() {
+// watchLoop: 负责监听 leader 变化
+func (s *Server) watchLoop(ctx context.Context) {
 	slog.Info("starting watch loop")
 	defer slog.Info("watch loop stopped")
 
 	// 直接 watch election prefix，监听所有变化
-	watchCh := s.data.Etcd.Watch(s.ctx, "/election/", clientv3.WithPrefix())
+	watchCh := s.data.Etcd.Watch(ctx, "/election/", clientv3.WithPrefix())
 
 	for {
 		slog.Debug("watch loop running...")
 		select {
-		case <-s.ctx.Done():
+		case <-ctx.Done():
 			slog.Info("watch loop received ctx.Done")
 			return
 
@@ -161,31 +179,56 @@ func (s *Server) watchLoop() {
 }
 
 // 2. Campaign Loop: 只负责竞选
-func (s *Server) campaignLoop() {
+func (s *Server) campaignLoop(ctx context.Context) {
 	slog.Info("starting campaign loop")
-	defer slog.Info("campaign loop stopped")
+
+	cleanup := func() {
+		slog.Info("campaign loop stopping")
+		s.mu.RLock()
+		isLeader := (s.currentRole == RoleLeader)
+		s.mu.RUnlock()
+
+		if isLeader {
+			slog.Info("resigning leadership")
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+
+			if err := s.election.Resign(ctx); err != nil {
+				slog.Error("failed to resign", "error", err)
+			}
+		}
+
+		slog.Info("campaign loop stopped")
+	}
+
+	defer cleanup()
 
 	// 定时检查兜底机制（每 30 秒检查一次）
-	checkTicker := time.NewTicker(30 * time.Second)
-	defer checkTicker.Stop()
+	go func() {
+		s.campaignCh <- struct{}{} // 初始触发
 
-	// 快速初始检查
-	go s.campaign()
+		checkInterval := 30 * time.Second
+		checkTimer := time.NewTicker(checkInterval)
+		defer checkTimer.Stop()
+
+		for range checkTimer.C {
+			select {
+			case s.campaignCh <- struct{}{}:
+			default:
+			}
+		}
+	}()
 
 	for {
 		slog.Debug("campaign loop running...")
 		select {
-		case <-s.ctx.Done():
+		case <-ctx.Done():
 			return
 
 		case <-s.campaignCh:
 			// 收到竞选触发信号（事件驱动）
 			slog.Debug("campaign triggered by event")
-			go s.campaign()
 
-		case <-checkTicker.C:
-			// 定期兜底检查
-			slog.Debug("periodic campaign check")
 			go s.campaign()
 		}
 	}
@@ -283,15 +326,15 @@ func (s *Server) campaign() {
 	}
 }
 
-// 3. Event Loop: 处理事件和业务逻辑切换
-func (s *Server) eventLoop() {
+// eventLoop: 处理事件和业务逻辑切换
+func (s *Server) eventLoop(ctx context.Context) {
 	slog.Info("starting event loop")
 	defer slog.Info("event loop stopped")
 
 	for {
 		slog.Debug("event loop running...")
 		select {
-		case <-s.ctx.Done():
+		case <-ctx.Done():
 			s.stopCurrentRole()
 			return
 
@@ -429,23 +472,4 @@ func (s *Server) followerLoop(ctx context.Context) {
 			}
 		}
 	}
-}
-
-func (s *Server) gracefulShutdown() {
-	// 只负责主动放弃 leadership，不关心业务逻辑的清理
-	s.mu.RLock()
-	isLeader := (s.currentRole == RoleLeader)
-	s.mu.RUnlock()
-
-	if isLeader {
-		slog.Info("resigning leadership")
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-
-		if err := s.election.Resign(ctx); err != nil {
-			slog.Error("failed to resign", "error", err)
-		}
-	}
-
-	slog.Info("graceful shutdown completed")
 }
