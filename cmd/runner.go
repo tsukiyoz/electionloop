@@ -41,7 +41,7 @@ func NewRunnerCommand() *cobra.Command {
 			}
 			defer data.Close()
 
-			server, err := server.NewServer(cmd.Context(), data)
+			server, err := server.NewServer(cmd.Context(), data, cfg.NodeID)
 			if err != nil {
 				return err
 			}

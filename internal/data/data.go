@@ -79,37 +79,3 @@ func (d *Data) Close() error {
 
 	return nil
 }
-
-// package main
-
-// import (
-// 	"context"
-// 	"crypto/tls"
-// 	"crypto/x509"
-// 	"fmt"
-// 	"os"
-
-// 	"demo/app/pkg/server"
-
-// 	clientv3 "go.etcd.io/etcd/client/v3"
-// 	"go.etcd.io/etcd/client/v3/concurrency"
-// )
-
-// func main() {
-// 	// Example: participate in election
-// 	if err := election.Campaign(ctx, "my-node"); err != nil {
-// 		panic(err)
-// 	}
-
-// 	// Watch loop
-// 	watchLoop(ctx)
-// }
-
-// func watchLoop(ctx context.Context) {
-// 	for {
-// 		select {
-// 		case <-ctx.Done():
-// 			return
-// 		}
-// 	}
-// }

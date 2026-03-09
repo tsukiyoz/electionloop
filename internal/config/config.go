@@ -7,7 +7,8 @@ import (
 )
 
 type Config struct {
-	ETCD *ETCDConfig
+	ETCD   *ETCDConfig
+	NodeID string
 }
 
 type ETCDConfig struct {
@@ -23,7 +24,10 @@ func NewConfig(opts *runner.Options) (*Config, error) {
 		return nil, fmt.Errorf("cliopts is not set")
 	}
 
-	cfg := &Config{}
+	cfg := &Config{
+		NodeID: opts.NodeID,
+	}
+
 	if opts.ETCD != nil {
 		cfg.ETCD = &ETCDConfig{
 			Endpoints: opts.ETCD.Endpoints,

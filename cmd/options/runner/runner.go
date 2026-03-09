@@ -9,7 +9,8 @@ import (
 type Options struct {
 	// HTTP *HTTPOptions
 	// GRPC *GRPCOptions
-	ETCD *ETCDOptions
+	ETCD   *ETCDOptions
+	NodeID string `mapstructure:"node-id"`
 }
 
 func NewOptions() *Options {
@@ -20,6 +21,7 @@ func NewOptions() *Options {
 
 func (s *Options) Flags() (fss cliflag.NamedFlagSets) {
 	s.ETCD.AddFlags(fss.FlagSet("etcd"))
+	fss.FlagSet("global").StringVar(&s.NodeID, "node-id", "", "node identifier for election")
 	return
 }
 
