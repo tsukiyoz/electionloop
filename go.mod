@@ -3,11 +3,12 @@ module zen
 go 1.25.0
 
 require (
-	github.com/google/wire v0.7.0
+	github.com/google/uuid v1.6.0
 	github.com/moby/term v0.5.2
 	github.com/spf13/cobra v1.10.2
 	github.com/spf13/pflag v1.0.10
 	github.com/spf13/viper v1.21.0
+	go.etcd.io/etcd/api/v3 v3.6.8
 	go.etcd.io/etcd/client/v3 v3.6.8
 )
 
@@ -27,7 +28,6 @@ require (
 	github.com/spf13/afero v1.15.0 // indirect
 	github.com/spf13/cast v1.10.0 // indirect
 	github.com/subosito/gotenv v1.6.0 // indirect
-	go.etcd.io/etcd/api/v3 v3.6.8 // indirect
 	go.etcd.io/etcd/client/pkg/v3 v3.6.8 // indirect
 	go.uber.org/multierr v1.11.0 // indirect
 	go.uber.org/zap v1.27.0 // indirect

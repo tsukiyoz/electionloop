@@ -1,10 +1,4 @@
-node-id: "node-1"
-
-http:
-  addr: "0.0.0.0:8000"
-
-grpc:
-  addr: "0.0.0.0:9000"
+# node-id: "node-1"
 
 etcd:
   endpoints:

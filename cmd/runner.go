@@ -4,8 +4,6 @@ Copyright © 2026 tsukiyo <tsukiyo6@163.com>
 package cmd
 
 import (
-	"log/slog"
-
 	"zen/cmd/options/runner"
 	"zen/internal/config"
 	"zen/internal/data"
@@ -28,8 +26,6 @@ func NewRunnerCommand() *cobra.Command {
 
 		PreRunE: app.PreRunE,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			slog.Info("runner called")
-
 			cfg, err := config.NewConfig(sopt)
 			if err != nil {
 				return err

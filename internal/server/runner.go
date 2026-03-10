@@ -48,53 +48,62 @@ type ElectionEvent struct {
 }
 
 type Server struct {
-	ctx    context.Context
-	data   *data.Data
-	nodeID string
+	ctx context.Context
 
-	mu            sync.RWMutex
-	currentRole   Role
-	roleCtx       context.Context
-	roleCancel    context.CancelFunc
-	election      *concurrency.Election
-	currentLeader string
+	nodeID   string
+	data     *data.Data
+	election *concurrency.Election
 
 	// Event channel for election events (only consumed by eventLoop)
 	eventCh chan ElectionEvent
 
 	// Channel to notify campaignLoop to start campaigning
 	campaignCh chan struct{}
+
+	logger *slog.Logger
 }
 
 func NewServer(ctx context.Context, data *data.Data, nodeID string) (*Server, error) {
-	return &Server{
-		ctx:           ctx,
-		data:          data,
-		nodeID:        nodeID,
-		currentRole:   RoleUnknown,
-		eventCh:       make(chan ElectionEvent, 10),
-		campaignCh:    make(chan struct{}, 1),
-		currentLeader: "",
-	}, nil
+	srv := &Server{
+		ctx:        ctx,
+		data:       data,
+		nodeID:     nodeID,
+		eventCh:    make(chan ElectionEvent, 10),
+		campaignCh: make(chan struct{}, 1),
+	}
+	srv.logger = slog.Default().With(slog.String("node-id", nodeID))
+	return srv, nil
 }
 
 func (s *Server) Run() error {
+	s.logger.Info("server running...")
+
+	return s.electionloop(s.ctx)
+}
+
+func (s *Server) electionloop(ctx context.Context) error {
+	logger := s.logger.With(slog.String("loop", "electionloop"))
+
+	logger.Debug("electionloop running...")
+	defer logger.Debug("electionloop stopped")
+
 	for {
 		select {
-		case <-s.ctx.Done():
-			slog.Info("server exited")
+		case <-ctx.Done():
 			return nil
 		default:
-			if err := s.run(s.ctx); err != nil {
-				slog.Error("session run failed", "err", err)
+			logger.Debug("start elect")
+			if err := s.elect(ctx); err != nil {
+				logger.Error("elect failed", "err", err)
 				time.Sleep(time.Millisecond * 100)
 			}
 		}
 	}
 }
 
-func (s *Server) run(ctx context.Context) error {
-	session, err := concurrency.NewSession(s.data.Etcd,
+func (s *Server) elect(ctx context.Context) error {
+	session, err := concurrency.NewSession(
+		s.data.Etcd,
 		concurrency.WithContext(ctx),
 		concurrency.WithTTL(15),
 	)
@@ -106,102 +115,93 @@ func (s *Server) run(ctx context.Context) error {
 	s.election = concurrency.NewElection(session, "/election")
 
 	var wg sync.WaitGroup
+	wg.Add(3)
 
-	wg.Go(func() {
-		s.eventLoop(ctx)
-	})
-	wg.Go(func() {
-		s.watchLoop(ctx)
-	})
-	wg.Go(func() {
-		s.campaignLoop(ctx)
-	})
+	go func() {
+		defer wg.Done()
+		s.eventLoop(session.Ctx())
+	}()
+	go func() {
+		defer wg.Done()
+		s.watchLoop(session.Ctx())
+	}()
+	go func() {
+		defer wg.Done()
+		s.campaignLoop(session.Ctx())
+	}()
 
 	wg.Wait()
-
-	slog.Info("session closed, stopping all loops")
 
 	return ctx.Err()
 }
 
 // watchLoop: 负责监听 leader 变化
 func (s *Server) watchLoop(ctx context.Context) {
-	slog.Info("starting watch loop")
-	defer slog.Info("watch loop stopped")
+	logger := s.logger.With(slog.String("loop", "watchloop"))
+
+	logger.Debug("watchloop running...")
+	defer logger.Debug("watchloop stopped")
 
 	// 直接 watch election prefix，监听所有变化
 	watchCh := s.data.Etcd.Watch(ctx, "/election/", clientv3.WithPrefix())
 
 	for {
-		slog.Debug("watch loop running...")
+		logger.Debug("watch loop running...")
 		select {
 		case <-ctx.Done():
-			slog.Info("watch loop received ctx.Done")
 			return
 
 		case wr, ok := <-watchCh:
 			if !ok {
-				slog.Info("watch channel closed")
+				logger.Info("watch channel closed")
 				return
 			}
 
 			if wr.Err() != nil {
-				slog.Error("watch error", "error", wr.Err())
+				logger.Error("watch error", "error", wr.Err())
 				return
 			}
 
 			for _, ev := range wr.Events {
-				slog.Debug("watch event",
+				logger.Debug("watch event",
 					"type", ev.Type.String(),
 					"key", string(ev.Kv.Key))
 
-				s.mu.Lock()
+				var evt ElectionEvent
 				switch ev.Type {
 				case mvccpb.PUT:
 					// 新 leader 当选
 					newLeader := string(ev.Kv.Value)
-					slog.Debug("leader elected/changed",
+					logger.Debug("leader elected/changed",
 						"new", newLeader)
-					s.eventCh <- ElectionEvent{
+					evt = ElectionEvent{
 						Type:   LeaderChanged,
 						Leader: newLeader,
 					}
 
 				case mvccpb.DELETE:
 					// Leader 消失（resign 或 session 过期）
-					slog.Debug("leader key deleted", "key", string(ev.Kv.Key))
-					s.eventCh <- ElectionEvent{Type: LeaderGone}
+					logger.Debug("leader key deleted", "key", string(ev.Kv.Key))
+					evt = ElectionEvent{Type: LeaderGone}
+
 				}
-				s.mu.Unlock()
+
+				select {
+				case <-ctx.Done():
+					return
+				case s.eventCh <- evt:
+				}
 			}
 		}
 	}
 }
 
-// 2. Campaign Loop: 只负责竞选
+// Campaign Loop: 负责竞选
 func (s *Server) campaignLoop(ctx context.Context) {
-	slog.Info("starting campaign loop")
+	logger := s.logger.With(slog.String("loop", "campaignloop"))
 
-	cleanup := func() {
-		slog.Info("campaign loop stopping")
-		s.mu.RLock()
-		isLeader := (s.currentRole == RoleLeader)
-		s.mu.RUnlock()
-
-		if isLeader {
-			slog.Info("resigning leadership")
-			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			defer cancel()
-
-			if err := s.election.Resign(ctx); err != nil {
-				slog.Error("failed to resign", "error", err)
-			}
-		}
-
-		slog.Info("campaign loop stopped")
-	}
-
-	defer cleanup()
+	logger.Debug("campaignloop running...")
+	defer logger.Debug("campaignloop stopped")
 
 	// 定时检查兜底机制（每 30 秒检查一次）
 	go func() {
@@ -227,23 +227,22 @@ func (s *Server) campaignLoop(ctx context.Context) {
 	}()
 
 	for {
-		slog.Debug("campaign loop running...")
 		select {
 		case <-ctx.Done():
 			return
 
 		case <-s.campaignCh:
 			// 收到竞选触发信号（事件驱动）
-			slog.Debug("campaign triggered by event")
+			logger.Debug("campaign triggered by event")
 
-			go s.campaign()
+			go s.campaign(ctx)
 		}
 	}
 }
 
 // campaign 同时竞选和观察当前 leader
-func (s *Server) campaign() {
-	slog.Debug("campaigning for leadership", "nodeID", s.nodeID)
+func (s *Server) campaign(ctx context.Context) {
+	s.logger.Debug("leadership checking")
 
 	// 先快速检查当前是否有 leader
 	resp, err := s.election.Leader(s.ctx)
@@ -251,22 +250,29 @@ func (s *Server) campaign() {
 	if err == nil {
 		if len(resp.Kvs) > 0 {
 			currentLeader := string(resp.Kvs[0].Value)
-			slog.Debug("current leader exists", "leader", currentLeader)
-			s.eventCh <- ElectionEvent{
+			s.logger.Debug("current leader exists", "leader", currentLeader)
+			evt := ElectionEvent{
 				Type:   LeaderElected,
 				Leader: currentLeader,
 			}
+
+			select {
+			case <-ctx.Done():
+				return
+			case s.eventCh <- evt:
+			}
+
 		}
 		return
 	}
 
 	if err != concurrency.ErrElectionNoLeader {
-		slog.Error("failed to check current leader", "error", err)
+		s.logger.Error("failed to check current leader", "error", err)
 		return
 	}
 
 	// 没有当前 leader，开始竞选
-	slog.Debug("no current leader, starting campaign")
+	s.logger.Debug("no leader, start campaigning")
 
 	// 创建一个 context 来控制竞选
 	campaignCtx, cancel := context.WithCancel(s.ctx)
@@ -285,49 +291,61 @@ func (s *Server) campaign() {
 		select {
 		case err := <-campaignCh:
 			if err != nil && err != context.Canceled {
-				slog.Error("campaign failed", "error", err)
+				s.logger.Error("campaign failed", "error", err)
 				return
 			}
 			if err == nil {
 				// 成功成为 leader
-				slog.Debug("became leader", "nodeID", s.nodeID)
-				s.eventCh <- ElectionEvent{
+				s.logger.Debug("campaign success")
+				evt := ElectionEvent{
 					Type:   LeaderElected,
 					Leader: s.nodeID,
+				}
+				select {
+				case <-ctx.Done():
+					return
+				case s.eventCh <- evt:
 				}
 			}
 			return
 
 		case resp, ok := <-observeCh:
 			if !ok {
-				slog.Debug("observe channel closed")
+				s.logger.Debug("observe channel closed")
 				return
 			}
 
 			// etcd Observe() sends []*mvccpb.KeyValue{nil} when leader is gone
 			if len(resp.Kvs) > 0 && resp.Kvs[0] != nil {
 				currentLeader := string(resp.Kvs[0].Value)
-				slog.Debug("observed current leader during campaign", "leader", currentLeader)
 
+				var evt ElectionEvent
 				if currentLeader == s.nodeID {
 					// 自己成为了 leader，取消竞选 goroutine
 					cancel()
-					slog.Debug("became leader", "nodeID", s.nodeID)
-					s.eventCh <- ElectionEvent{
+					s.logger.Debug("became leader")
+					evt = ElectionEvent{
 						Type:   LeaderElected,
 						Leader: s.nodeID,
 					}
-					return
+
 				} else {
 					// 竞选期间有其他节点抢先成为 leader
 					cancel()
-					slog.Debug("other node became leader during campaign", "leader", currentLeader)
-					s.eventCh <- ElectionEvent{
+					s.logger.Debug("observed leader during campaign", "leader", currentLeader)
+					evt = ElectionEvent{
 						Type:   LeaderElected,
 						Leader: currentLeader,
 					}
-					return
+
 				}
+
+				select {
+				case <-ctx.Done():
+					return
+				case s.eventCh <- evt:
+				}
+				return
 			}
 		}
 	}
@@ -335,113 +353,128 @@ func (s *Server) campaign() {
 
 // eventLoop: 处理事件和业务逻辑切换
 func (s *Server) eventLoop(ctx context.Context) {
-	slog.Info("starting event loop")
-	defer slog.Info("event loop stopped")
+	var (
+		currentRole   Role = RoleUnknown
+		currentLeader string
+		roleCtx       context.Context
+		roleCancel    context.CancelFunc
+		logger        *slog.Logger = s.logger.With(slog.String("loop", "eventloop"))
+	)
+
+	logger.Debug("running...")
+	defer logger.Debug("stopped")
+
+	regisnLeadership := func() {
+		if currentRole == RoleLeader {
+			logger.Debug("resigning leadership")
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+
+			if err := s.election.Resign(ctx); err != nil {
+				logger.Error("failed to resign", "error", err)
+			} else {
+				logger.Debug("resign leadership success")
+			}
+		}
+	}
+
+	defer regisnLeadership()
+
+	stopCurrentRole := func() {
+		if roleCancel != nil {
+			logger.Debug("stopping current role", "role", currentRole)
+			roleCancel()
+			roleCancel = nil
+			roleCtx = nil
+		}
+	}
+	startNewRole := func(newRole Role) {
+		roleCtx, roleCancel = context.WithCancel(s.ctx)
+
+		switch newRole {
+		case RoleLeader:
+			go s.leaderLoop(roleCtx)
+		case RoleFollower:
+			go s.followerLoop(roleCtx)
+		}
+
+		currentRole = newRole
+	}
 
 	for {
-		slog.Debug("event loop running...")
 		select {
 		case <-ctx.Done():
-			s.stopCurrentRole()
+			stopCurrentRole()
 			return
 
-		case event := <-s.eventCh:
-			s.handleEvent(event)
+		case evt := <-s.eventCh:
+			logger.Debug("got event",
+				"event", evt.Type.String(),
+				"leader", evt.Leader,
+			)
+
+			var newRole Role
+
+			switch evt.Type {
+			case LeaderElected, LeaderChanged:
+				if currentLeader == evt.Leader {
+					continue
+				}
+
+				logger.Debug("leader changing",
+					"old", currentLeader,
+					"new", evt.Leader,
+				)
+				currentLeader = evt.Leader
+				if currentLeader == s.nodeID {
+					newRole = RoleLeader
+				} else {
+					newRole = RoleFollower
+				}
+
+			case LeaderGone:
+				// Leader 消失，通知 campaignLoop 开始竞选
+				currentLeader = ""
+				select {
+				case <-ctx.Done():
+					return
+				case s.campaignCh <- struct{}{}:
+					logger.Debug("try campaign")
+				}
+			}
+
+			if newRole != currentRole {
+				logger.Debug("role changing", "from", currentRole, "to", newRole)
+				stopCurrentRole()
+				startNewRole(newRole)
+			}
 		}
-	}
-}
-
-func (s *Server) handleEvent(event ElectionEvent) {
-	slog.Debug("eventloop got event",
-		"event", event.Type.String(),
-		"leader", event.Leader,
-	)
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	var newRole Role
-
-	switch event.Type {
-	case LeaderElected, LeaderChanged:
-		slog.Debug("leader changing",
-			"old", s.currentLeader,
-			"new", event.Leader,
-		)
-		s.currentLeader = event.Leader
-		if event.Leader == s.nodeID {
-			newRole = RoleLeader
-		} else {
-			newRole = RoleFollower
-		}
-
-	case LeaderGone:
-		// Leader 消失，通知 campaignLoop 开始竞选
-		s.currentLeader = ""
-		slog.Debug("leader gone, triggering campaign")
-		select {
-		case s.campaignCh <- struct{}{}:
-			slog.Debug("event loop trigger campaign success")
-		default:
-		}
-		return
-	}
-
-	if newRole != s.currentRole {
-		slog.Debug("role changing", "from", s.currentRole, "to", newRole)
-		s.switchRole(newRole)
-	}
-}
-
-func (s *Server) switchRole(newRole Role) {
-	// 停止当前角色
-	s.stopCurrentRole()
-
-	// 启动新角色
-	s.currentRole = newRole
-	s.roleCtx, s.roleCancel = context.WithCancel(s.ctx)
-
-	switch newRole {
-	case RoleLeader:
-		go s.leaderLoop(s.roleCtx)
-	case RoleFollower:
-		go s.followerLoop(s.roleCtx)
-	}
-}
-
-func (s *Server) stopCurrentRole() {
-	if s.roleCancel != nil {
-		slog.Debug("stopping current role", "role", s.currentRole)
-		s.roleCancel()
-		s.roleCancel = nil
-		s.roleCtx = nil
 	}
 }
 
 // Leader Loop: Leader 的业务逻辑
 func (s *Server) leaderLoop(ctx context.Context) {
-	slog.Info("starting leader loop")
-
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
 
 	for {
 		select {
 		case <-ctx.Done():
-			slog.Info("leader loop stopped")
+			s.logger.Info("leader loop stopped")
 			return
 
 		case <-ticker.C:
-			slog.Info("leader working...")
+			s.logger.Info("leader working...")
 
 			// Leader specific work here
 			resp, err := s.data.Etcd.Get(ctx, "foo")
 			if err != nil {
-				slog.Error("leader get failed", "error", err)
+				s.logger.Error("leader get failed", "error", err)
 				continue
 			}
 
 			if len(resp.Kvs) > 0 {
-				slog.Info("leader: data found",
+				s.logger.Info("leader: data found",
 					"key", string(resp.Kvs[0].Key),
 					"value", string(resp.Kvs[0].Value))
 			}
@@ -451,29 +484,27 @@ func (s *Server) leaderLoop(ctx context.Context) {
 
 // Follower Loop: Follower 的业务逻辑
 func (s *Server) followerLoop(ctx context.Context) {
-	slog.Info("starting follower loop")
-
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
 
 	for {
 		select {
 		case <-ctx.Done():
-			slog.Info("follower loop stopped")
+			s.logger.Info("follower loop stopped")
 			return
 
 		case <-ticker.C:
-			slog.Info("follower working...")
+			s.logger.Info("follower working...")
 
 			// Follower specific work here
 			resp, err := s.data.Etcd.Get(ctx, "foo")
 			if err != nil {
-				slog.Error("follower get failed", "error", err)
+				s.logger.Error("follower get failed", "error", err)
 				continue
 			}
 
 			if len(resp.Kvs) > 0 {
-				slog.Info("follower: data found",
+				s.logger.Info("follower: data found",
 					"key", string(resp.Kvs[0].Key),
 					"value", string(resp.Kvs[0].Value))
 			}

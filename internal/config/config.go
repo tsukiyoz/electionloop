@@ -4,6 +4,8 @@ import (
 	"fmt"
 
 	"zen/cmd/options/runner"
+
+	"github.com/google/uuid"
 )
 
 type Config struct {
@@ -24,12 +26,12 @@ func NewConfig(opts *runner.Options) (*Config, error) {
 		return nil, fmt.Errorf("cliopts is not set")
 	}
 
-	cfg := &Config{
+	c := &Config{
 		NodeID: opts.NodeID,
 	}
 
 	if opts.ETCD != nil {
-		cfg.ETCD = &ETCDConfig{
+		c.ETCD = &ETCDConfig{
 			Endpoints: opts.ETCD.Endpoints,
 			TLSCacert: opts.ETCD.TlsCacert,
 			TLSCert:   opts.ETCD.TlsCert,
@@ -37,5 +39,9 @@ func NewConfig(opts *runner.Options) (*Config, error) {
 		}
 	}
 
-	return cfg, nil
+	if c.NodeID == "" {
+		c.NodeID = uuid.NewString()
+	}
+
+	return c, nil
 }
