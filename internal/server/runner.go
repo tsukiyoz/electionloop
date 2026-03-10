@@ -205,7 +205,12 @@ func (s *Server) campaignLoop(ctx context.Context) {
 
 	// 定时检查兜底机制（每 30 秒检查一次）
 	go func() {
-		s.campaignCh <- struct{}{} // 初始触发
+		select {
+		case <-ctx.Done():
+			return
+		case s.campaignCh <- struct{}{}:
+			// 初始触发
+		}
 
 		checkInterval := 30 * time.Second
 		checkTimer := time.NewTicker(checkInterval)
@@ -213,6 +218,8 @@ func (s *Server) campaignLoop(ctx context.Context) {
 
 		for range checkTimer.C {
 			select {
+			case <-ctx.Done():
+				return
 			case s.campaignCh <- struct{}{}:
 			default:
 			}
