@@ -4,10 +4,8 @@ Copyright © 2026 tsukiyo <tsukiyo6@163.com>
 package cmd
 
 import (
-	"zen/cmd/options/runner"
-	"zen/internal/config"
-	"zen/internal/data"
-	"zen/internal/server"
+	option "zen/cmd/options/runner"
+	"zen/internal/runner"
 	"zen/pkg/app"
 
 	"github.com/spf13/cobra"
@@ -17,7 +15,7 @@ import (
 var runnerCmd = NewRunnerCommand()
 
 func NewRunnerCommand() *cobra.Command {
-	sopt := runner.NewOptions()
+	sopt := option.NewOptions()
 
 	c := &cobra.Command{
 		Use:   "runner",
@@ -26,23 +24,22 @@ func NewRunnerCommand() *cobra.Command {
 
 		PreRunE: app.PreRunE,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			cfg, err := config.NewConfig(sopt)
+			cfg, err := runner.NewConfig(sopt)
 			if err != nil {
 				return err
 			}
 
-			data, err := data.NewData(cfg)
-			if err != nil {
-				return err
-			}
-			defer data.Close()
-
-			server, err := server.NewServer(cmd.Context(), data, cfg.NodeID)
+			completed, err := cfg.Complete()
 			if err != nil {
 				return err
 			}
 
-			return server.Run()
+			server, err := runner.CreateServer(completed)
+			if err != nil {
+				return err
+			}
+
+			return server.Run(cmd.Context())
 		},
 	}
 

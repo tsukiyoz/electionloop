@@ -1,12 +1,10 @@
-package server
+package runner
 
 import (
 	"context"
 	"log/slog"
 	"sync"
 	"time"
-
-	"zen/internal/data"
 
 	"go.etcd.io/etcd/api/v3/mvccpb"
 	clientv3 "go.etcd.io/etcd/client/v3"
@@ -48,11 +46,12 @@ type ElectionEvent struct {
 }
 
 type Server struct {
-	ctx context.Context
+	nodeID string
 
-	nodeID   string
-	data     *data.Data
+	etcdConfig *clientv3.Config
+
 	election *concurrency.Election
+	etcd     *clientv3.Client
 
 	// Event channel for election events (only consumed by eventLoop)
 	eventCh chan ElectionEvent
@@ -63,22 +62,31 @@ type Server struct {
 	logger *slog.Logger
 }
 
-func NewServer(ctx context.Context, data *data.Data, nodeID string) (*Server, error) {
+func CreateServer(config CompletedConfig) (*Server, error) {
 	srv := &Server{
-		ctx:        ctx,
-		data:       data,
-		nodeID:     nodeID,
 		eventCh:    make(chan ElectionEvent, 10),
 		campaignCh: make(chan struct{}, 1),
 	}
-	srv.logger = slog.Default().With(slog.String("node-id", nodeID))
+
+	srv.nodeID = config.NodeID
+	srv.etcdConfig = config.EtcdConfig
+
+	srv.logger = slog.Default().With(slog.String("node", config.NodeID))
 	return srv, nil
 }
 
-func (s *Server) Run() error {
+func (s *Server) Run(ctx context.Context) error {
 	s.logger.Info("server running...")
 
-	return s.electionloop(s.ctx)
+	etcd, err := clientv3.New(*s.etcdConfig)
+	if err != nil {
+		return err
+	}
+	defer etcd.Close()
+
+	s.etcd = etcd
+
+	return s.electionloop(ctx)
 }
 
 func (s *Server) electionloop(ctx context.Context) error {
@@ -103,7 +111,7 @@ func (s *Server) electionloop(ctx context.Context) error {
 
 func (s *Server) elect(ctx context.Context) error {
 	session, err := concurrency.NewSession(
-		s.data.Etcd,
+		s.etcd,
 		concurrency.WithContext(ctx),
 		concurrency.WithTTL(15),
 	)
@@ -143,7 +151,7 @@ func (s *Server) watchLoop(ctx context.Context) {
 	defer logger.Debug("watchloop stopped")
 
 	// 直接 watch election prefix，监听所有变化
-	watchCh := s.data.Etcd.Watch(ctx, "/election/", clientv3.WithPrefix())
+	watchCh := s.etcd.Watch(ctx, "/election/", clientv3.WithPrefix())
 
 	for {
 		logger.Debug("watch loop running...")
@@ -245,7 +253,7 @@ func (s *Server) campaign(ctx context.Context) {
 	s.logger.Debug("leadership checking")
 
 	// 先快速检查当前是否有 leader
-	resp, err := s.election.Leader(s.ctx)
+	resp, err := s.election.Leader(ctx)
 
 	if err == nil {
 		if len(resp.Kvs) > 0 {
@@ -275,7 +283,7 @@ func (s *Server) campaign(ctx context.Context) {
 	s.logger.Debug("no leader, start campaigning")
 
 	// 创建一个 context 来控制竞选
-	campaignCtx, cancel := context.WithCancel(s.ctx)
+	campaignCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
 	// 启动竞选 goroutine
@@ -389,7 +397,7 @@ func (s *Server) eventLoop(ctx context.Context) {
 		}
 	}
 	startNewRole := func(newRole Role) {
-		roleCtx, roleCancel = context.WithCancel(s.ctx)
+		roleCtx, roleCancel = context.WithCancel(ctx)
 
 		switch newRole {
 		case RoleLeader:
@@ -454,6 +462,7 @@ func (s *Server) eventLoop(ctx context.Context) {
 
 // Leader Loop: Leader 的业务逻辑
 func (s *Server) leaderLoop(ctx context.Context) {
+	s.logger.Info("leaderloop running...")
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
 
@@ -467,7 +476,7 @@ func (s *Server) leaderLoop(ctx context.Context) {
 			s.logger.Info("leader working...")
 
 			// Leader specific work here
-			resp, err := s.data.Etcd.Get(ctx, "foo")
+			resp, err := s.etcd.Get(ctx, "foo")
 			if err != nil {
 				s.logger.Error("leader get failed", "error", err)
 				continue
@@ -484,6 +493,7 @@ func (s *Server) leaderLoop(ctx context.Context) {
 
 // Follower Loop: Follower 的业务逻辑
 func (s *Server) followerLoop(ctx context.Context) {
+	s.logger.Info("followerloop running...")
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
 
@@ -497,7 +507,7 @@ func (s *Server) followerLoop(ctx context.Context) {
 			s.logger.Info("follower working...")
 
 			// Follower specific work here
-			resp, err := s.data.Etcd.Get(ctx, "foo")
+			resp, err := s.etcd.Get(ctx, "foo")
 			if err != nil {
 				s.logger.Error("follower get failed", "error", err)
 				continue
